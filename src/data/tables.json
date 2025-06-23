@@ -1,0 +1,23 @@
+[
+  {
+    "id": "T01",
+    "label": "Table 1",
+    "type": "classique",
+    "x": 100,
+    "y": 200
+  },
+  {
+    "id": "V01",
+    "label": "VIP A",
+    "type": "vip",
+    "x": 300,
+    "y": 250
+  },
+  {
+    "id": "DJ",
+    "label": "DJ Booth",
+    "type": "dj",
+    "x": 500,
+    "y": 50
+  }
+]

@@ -1,0 +1,14 @@
+[
+  {
+    "id": "vodka_belvedere",
+    "nom": "Belv\u00e9d\u00e8re 70cl",
+    "prix": 180,
+    "categorie": "bouteilles"
+  },
+  {
+    "id": "moet",
+    "nom": "Mo\u00ebt & Chandon",
+    "prix": 220,
+    "categorie": "champagnes"
+  }
+]
