@@ -79,5 +79,12 @@ export function renameLinks(text: string, oldName: string, newName: string): str
 }
 
 export function stripAccents(s: string): string {
-  return s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+  // Apostrophes et guillemets typographiques des PDF = ceux du clavier.
+  return s
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[‘’ʼ`´]/g, "'")
+    .replace(/[“”«»„]/g, '"')
+    .replace(/[\u00A0\u202F]/g, " ")
+    .toLowerCase();
 }
