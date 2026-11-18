@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { exclusive, sync, resolveInVault, toRel, walk, readText, writeText, VAULT_DIR } from "./vault.js";
 import { parseProps, setProps, appendToSection, renameLinks, stripAccents } from "./markdown.js";
 import { isPdf, pdfPages, readPdf } from "./pdf.js";
-import { pdfToMarkdown, verifierFiche } from "./fiches.js";
+import { pdfToMarkdown, verifierFiche, estValidee, motifsNonProuvee } from "./fiches.js";
 import { etatCrm, todayParis, CRM_ROOT } from "./crm.js";
 
 const INSTRUCTIONS = `Connecteur du coffre Obsidian « Vie » de Stive (synchronisé par Obsidian Sync : ce que tu écris arrive sur son iPhone, son iPad et son Mac).
@@ -16,6 +16,7 @@ Deux espaces : « CRM GPM » (CRM commercial prévoyance GPM) et « Garde-robe �
 - Groupe toutes les modifications d'une dictée dans UN seul appel à \`modifier\`.
 - Pour le brief du matin ou une revue : \`etat_crm\`, puis écris la note dans « CRM GPM/Briefs » au format des briefs existants.
 - Les documents PDF du coffre se lisent avec \`lire\` (texte extrait, paramètre \`pages\` pour les longs documents) et sont couverts par \`chercher\`. Ils sont en lecture seule.
+- RÈGLE ABSOLUE : une note n'est « Validé » que si \`verifier\` la donne conforme sans aucun avertissement (chaque affirmation et chaque chiffre appuyés par une citation exacte du PDF source). Sinon « À tester » ou « Brouillon ». \`modifier\` déclasse d'office toute note validée sans preuve, et \`etat_crm\` liste celles qui le seraient redevenues (\`fiches_validees_sans_preuve\`). Ne jamais répondre sur un point contractuel depuis une note non validée sans le dire et sans citer le PDF.
 - Fiches sourcées : chaque affirmation s'appuie sur une citation \`> [!quote] [[….pdf#page=N|Art. X, p. N]]\` suivie du texte exact ; après écriture, lancer \`verifier\` et corriger jusqu'à « conforme ».
 - Jamais de données de santé d'un contact dans le coffre.
 - Dates au format AAAA-MM-JJ, fuseau Europe/Paris.`;
@@ -31,6 +32,33 @@ function excerpt(line: string, q: string): string {
   const i = Math.max(0, stripAccents(l).indexOf(q));
   const start = Math.max(0, i - 120);
   return (start ? "…" : "") + l.slice(start, start + 300) + (start + 300 < l.length ? "…" : "");
+}
+
+/** Notes validées d'un dossier qui ne passent pas le contrôle strict des citations. */
+async function valideesATort(dirAbs: string): Promise<{ fiche: string; motifs: string[] }[]> {
+  const out: { fiche: string; motifs: string[] }[] = [];
+  for (const p of (await walk(dirAbs)).filter((f) => f.endsWith(".md")).sort()) {
+    const md = await readText(p);
+    const props = parseProps(md);
+    if (!estValidee(props)) continue;
+    const motifs = await motifsNonProuvee(p, md, props);
+    if (motifs.length) out.push({ fiche: toRel(p), motifs: motifs.map((m) => m.slice(0, 200)) });
+  }
+  return out;
+}
+
+/** Garde-fou : une note touchée et marquée validée sans preuve est déclassée d'office en « À tester ». */
+async function declasserSiNonProuvee(abs: string): Promise<string | null> {
+  if (!abs.endsWith(".md") || !existsSync(abs)) return null;
+  const md = await readText(abs);
+  const props = parseProps(md);
+  if (!estValidee(props)) return null;
+  const motifs = await motifsNonProuvee(abs, md, props);
+  if (!motifs.length) return null;
+  const maj: Record<string, unknown> = { maturite: "À tester" };
+  if (typeof props.statut === "string") maj.statut = "brouillon";
+  await writeText(abs, setProps(md, maj));
+  return `DÉCLASSÉE en « À tester » (validation refusée) : ${toRel(abs)} : ${motifs.length} motif(s), dont : ${motifs[0].slice(0, 160)}`;
 }
 
 /** Lance une opération sur un coffre à jour ; option : resynchroniser après écriture. */
@@ -221,7 +249,13 @@ export function buildServer(): McpServer {
     },
     async ({ jours }) => {
       try {
-        return json(await withVault(() => etatCrm(jours)));
+        return json(
+          await withVault(async () => {
+            const etat = await etatCrm(jours);
+            const aTort = await valideesATort(await resolveInVault(CRM_ROOT)).catch(() => []);
+            return { ...etat, fiches_validees_sans_preuve: aTort };
+          }),
+        );
       } catch (e) {
         return fail(e);
       }
@@ -373,7 +407,8 @@ export function buildServer(): McpServer {
       description:
         "Contrôle mécanique de fiches sourcées : chaque citation « > [!quote] [[….pdf#page=N|…]] » doit figurer mot pour mot à la page indiquée du PDF. " +
         "Signale aussi les chiffres affirmés sans appui dans une citation et les PDF modifiés depuis la validation (propriété `empreintes`). " +
-        "À lancer après chaque écriture de fiche : une fiche « non conforme » ne doit pas servir à répondre.",
+        "Sur un dossier, contrôle aussi toute note marquée « Validé », même sans citation : `validee_a_tort: true` signale une note validée sans preuve. " +
+        "Règle : une note ne peut être « Validé » que si elle est conforme et sans aucun avertissement ; `modifier` déclasse d'office les autres.",
       inputSchema: {
         chemins: z.array(z.string()).max(50).default([]).describe("Fiches à contrôler"),
         dossier: z.string().default("").describe("Ou un dossier entier : toutes les notes contenant au moins une citation"),
@@ -398,7 +433,11 @@ export function buildServer(): McpServer {
           for (const abs of fromDir) {
             if (targets.includes(abs)) continue;
             const md = await readText(abs);
-            if (/^>\s*\[!quote\]/im.test(md)) res.push(await verifierFiche(abs, md, parseProps(md)));
+            const props = parseProps(md);
+            const validee = estValidee(props);
+            if (!validee && !/^>\s*\[!quote\]/im.test(md)) continue;
+            const r = await verifierFiche(abs, md, props);
+            res.push({ ...r, maturite: props.maturite ?? null, validee_a_tort: validee && (r.erreurs.length > 0 || r.avertissements.length > 0) });
           }
           return res;
         });
@@ -426,6 +465,15 @@ export function buildServer(): McpServer {
           try {
             for (const o of operations) done.push(await applyOp(o));
           } finally {
+            // Aucune note ne reste « Validé » sans preuve après une écriture.
+            const touchees = new Set<string>();
+            for (const o of operations) {
+              for (const c of [o.chemin, o.nouveau_chemin]) if (c) touchees.add(await resolveInVault(c).catch(() => ""));
+            }
+            for (const abs of touchees) {
+              const msg = abs ? await declasserSiNonProuvee(abs).catch(() => null) : null;
+              if (msg) done.push(msg);
+            }
             await sync();
           }
         });

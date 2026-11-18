@@ -188,3 +188,17 @@ export async function verifierFiche(abs: string, md: string, declared: Record<st
     sources: [...sources].map(([pdf, e]) => ({ pdf, empreinte: e })),
   };
 }
+
+/** Une note est « validée » si sa maturité ou son statut le dit. */
+export function estValidee(props: Record<string, unknown>): boolean {
+  return [props.maturite, props.statut].some((v) => typeof v === "string" && /^valid/i.test(v.trim()));
+}
+
+/**
+ * Contrôle strict, exigé pour toute note validée : au moins une citation, toutes retrouvées mot pour mot,
+ * aucun chiffre hors citation sans appui, empreinte de chaque PDF déclarée. Renvoie les motifs d'échec (vide = prouvée).
+ */
+export async function motifsNonProuvee(abs: string, md: string, props: Record<string, unknown>): Promise<string[]> {
+  const r = await verifierFiche(abs, md, props);
+  return [...r.erreurs, ...r.avertissements];
+}
