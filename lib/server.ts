@@ -45,7 +45,7 @@ function withVault<T>(fn: () => Promise<T>, pushAfter = false) {
 
 const Operation = z.object({
   op: z
-    .enum(["ecrire", "creer", "remplacer", "proprietes", "ajouter_ligne", "renommer", "supprimer", "convertir_pdf"])
+    .enum(["ecrire", "creer", "remplacer", "proprietes", "ajouter_ligne", "renommer", "supprimer", "convertir_pdf", "importer"])
     .describe(
       "ecrire = créer ou écraser la note avec `contenu` ; creer = comme ecrire mais échoue si la note existe ; " +
         "remplacer = remplacer le texte exact `ancien` par `nouveau` (doit apparaître une seule fois) ; " +
@@ -54,7 +54,8 @@ const Operation = z.object({
         "renommer = déplacer/renommer vers `nouveau_chemin` et mettre à jour tous les liens [[...]] du coffre ; " +
         "supprimer = supprimer la note (récupérable dans l'historique Obsidian Sync) ; " +
         "convertir_pdf = créer la note « texte intégral » du PDF `chemin` (texte extrait mécaniquement, une section par page, sans passer par Claude), " +
-        "à côté du PDF ou vers `nouveau_chemin`.",
+        "à côté du PDF ou vers `nouveau_chemin` ; " +
+        "importer = copier dans le coffre, à `chemin`, le fichier `contenu` (nom exact) livré avec le connecteur dans son dossier imports.",
     ),
   chemin: z.string().describe("Chemin depuis la racine du coffre, extension comprise. Ex : « CRM GPM/Contacts/Jean-Marc SOUTY.md »."),
   contenu: z.string().optional(),
@@ -70,6 +71,19 @@ type Op = z.infer<typeof Operation>;
 async function applyOp(o: Op): Promise<string> {
   const abs = await resolveInVault(o.chemin);
   const rel = toRel(abs);
+  if (o.op === "importer") {
+    if (!o.contenu) throw new Error("importer : champ « contenu » (nom du fichier) manquant");
+    const nom = path.basename(o.contenu);
+    const src = path.join(process.cwd(), "imports", nom);
+    if (!existsSync(src)) {
+      const dispo = existsSync(path.join(process.cwd(), "imports")) ? await fs.readdir(path.join(process.cwd(), "imports")) : [];
+      throw new Error(`Fichier à importer introuvable : ${nom}. Disponibles : ${dispo.join(", ") || "(aucun)"}`);
+    }
+    if (existsSync(abs)) throw new Error(`Existe déjà : ${rel}`);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.copyFile(src, abs);
+    return `importé : ${nom} → ${rel}`;
+  }
   if (o.op === "convertir_pdf") {
     if (!isPdf(abs) || !existsSync(abs)) throw new Error(`PDF introuvable : ${o.chemin}`);
     const dest = await resolveInVault(o.nouveau_chemin ?? `${rel.replace(/\.pdf$/i, "")} (texte intégral).md`);
