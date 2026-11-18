@@ -5,6 +5,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { exclusive, sync, resolveInVault, toRel, walk, readText, writeText, VAULT_DIR } from "./vault.js";
 import { parseProps, setProps, appendToSection, renameLinks, stripAccents } from "./markdown.js";
+import { isPdf, pdfPages, readPdf } from "./pdf.js";
 import { etatCrm, todayParis, CRM_ROOT } from "./crm.js";
 
 const INSTRUCTIONS = `Connecteur du coffre Obsidian « Vie » de Stive (synchronisé par Obsidian Sync : ce que tu écris arrive sur son iPhone, son iPad et son Mac).
@@ -13,12 +14,22 @@ Deux espaces : « CRM GPM » (CRM commercial prévoyance GPM) et « Garde-robe �
 - Stive dicte en vrac : tu ranges sans lui reposer de questions, sauf nom ou date ambigus.
 - Groupe toutes les modifications d'une dictée dans UN seul appel à \`modifier\`.
 - Pour le brief du matin ou une revue : \`etat_crm\`, puis écris la note dans « CRM GPM/Briefs » au format des briefs existants.
+- Les documents PDF du coffre se lisent avec \`lire\` (texte extrait, paramètre \`pages\` pour les longs documents) et sont couverts par \`chercher\`. Ils sont en lecture seule.
 - Jamais de données de santé d'un contact dans le coffre.
 - Dates au format AAAA-MM-JJ, fuseau Europe/Paris.`;
 
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }] });
 const json = (v: unknown) => text(JSON.stringify(v, null, 1));
 const fail = (e: unknown) => ({ ...text(`Erreur : ${e instanceof Error ? e.message : String(e)}`), isError: true });
+
+/** Extrait d'environ 300 caractères centré sur le terme trouvé (les lignes d'un PDF peuvent être très longues). */
+function excerpt(line: string, q: string): string {
+  const l = line.trim();
+  if (l.length <= 300) return l;
+  const i = Math.max(0, stripAccents(l).indexOf(q));
+  const start = Math.max(0, i - 120);
+  return (start ? "…" : "") + l.slice(start, start + 300) + (start + 300 < l.length ? "…" : "");
+}
 
 /** Lance une opération sur un coffre à jour ; option : resynchroniser après écriture. */
 function withVault<T>(fn: () => Promise<T>, pushAfter = false) {
@@ -55,6 +66,9 @@ type Op = z.infer<typeof Operation>;
 async function applyOp(o: Op): Promise<string> {
   const abs = await resolveInVault(o.chemin);
   const rel = toRel(abs);
+  if (isPdf(abs) && o.op !== "renommer" && o.op !== "supprimer") {
+    throw new Error(`${o.op} impossible sur un PDF : ${rel} (seuls renommer et supprimer sont permis)`);
+  }
   const need = <K extends keyof Op>(k: K): NonNullable<Op[K]> => {
     if (o[k] === undefined || o[k] === null) throw new Error(`${o.op} sur « ${o.chemin} » : champ « ${String(k)} » manquant`);
     return o[k] as NonNullable<Op[K]>;
@@ -93,6 +107,7 @@ async function applyOp(o: Op): Promise<string> {
       if (existsSync(dest)) throw new Error(`Destination déjà existante : ${toRel(dest)}`);
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.rename(abs, dest);
+      // Une note se lie par son nom sans extension, un PDF par son nom complet.
       const oldName = path.basename(abs, ".md");
       const newName = path.basename(dest, ".md");
       let touched = 0;
@@ -192,7 +207,7 @@ export function buildServer(): McpServer {
     {
       title: "Lister un dossier",
       description:
-        "Liste les notes d'un dossier du coffre (récursif), avec leurs propriétés principales. Ex : « CRM GPM/Contacts », « CRM GPM/Échéances », « Garde-robe/Pièces ». Dossier vide = tout le coffre (chemins seulement).",
+        "Liste les notes et documents PDF d'un dossier du coffre (récursif), avec les propriétés principales des notes et la taille des PDF. Ex : « CRM GPM/Contacts », « CRM GPM/Échéances », « Garde-robe/Pièces ». Dossier vide = tout le coffre (chemins seulement).",
       inputSchema: {
         dossier: z.string().default(""),
         avec_proprietes: z.boolean().default(true).describe("Inclure les propriétés (frontmatter) de chaque note"),
@@ -207,7 +222,9 @@ export function buildServer(): McpServer {
           if (!dossier || !avec_proprietes) return files.map(toRel);
           const res = [];
           for (const p of files) {
-            res.push(p.endsWith(".md") ? { chemin: toRel(p), ...parseProps(await readText(p)) } : { chemin: toRel(p) });
+            if (p.endsWith(".md")) res.push({ chemin: toRel(p), ...parseProps(await readText(p)) });
+            else if (isPdf(p)) res.push({ chemin: toRel(p), taille_ko: Math.ceil((await fs.stat(p)).size / 1024) });
+            else res.push({ chemin: toRel(p) });
           }
           return res;
         });
@@ -221,20 +238,34 @@ export function buildServer(): McpServer {
   server.registerTool(
     "lire",
     {
-      title: "Lire des notes",
-      description: "Renvoie le contenu complet d'une ou plusieurs notes (chemins depuis la racine du coffre, extension comprise).",
-      inputSchema: { chemins: z.array(z.string()).min(1).max(30) },
+      title: "Lire des notes et des PDF",
+      description:
+        "Renvoie le contenu complet d'une ou plusieurs notes, ou le texte extrait de documents PDF (chemins depuis la racine du coffre, extension comprise). " +
+        "Un long PDF est tronqué : la réponse indique alors quelles `pages` redemander.",
+      inputSchema: {
+        chemins: z.array(z.string()).min(1).max(30),
+        pages: z.string().optional().describe("Pour les PDF seulement : pages à lire, ex : « 3 », « 2-5 », « 1,4-6 ». Par défaut, depuis la page 1."),
+      },
       annotations: { readOnlyHint: true },
     },
-    async ({ chemins }) => {
+    async ({ chemins, pages }) => {
       try {
         const out = await withVault(async () => {
           const parts: string[] = [];
+          // Budget de texte partagé entre les PDF demandés dans le même appel.
+          const maxChars = Math.floor(80_000 / Math.max(1, chemins.filter(isPdf).length));
           for (const c of chemins) {
             const abs = await resolveInVault(c);
-            parts.push(
-              existsSync(abs) ? `===== ${toRel(abs)} =====\n${await readText(abs)}` : `===== ${c} =====\n(introuvable)`,
-            );
+            if (!existsSync(abs)) parts.push(`===== ${c} =====\n(introuvable)`);
+            else if (isPdf(abs)) {
+              let body: string;
+              try {
+                body = await readPdf(abs, pages, maxChars);
+              } catch (e) {
+                body = `(PDF illisible : ${e instanceof Error ? e.message : String(e)})`;
+              }
+              parts.push(`===== ${toRel(abs)} =====\n${body}`);
+            } else parts.push(`===== ${toRel(abs)} =====\n${await readText(abs)}`);
           }
           return parts.join("\n\n");
         });
@@ -250,7 +281,7 @@ export function buildServer(): McpServer {
     {
       title: "Chercher dans le coffre",
       description:
-        "Recherche plein texte, insensible aux accents et à la casse, dans les noms et le contenu des notes. Sert à retrouver un contact (nom, téléphone, ville), un sujet, une objection…",
+        "Recherche plein texte, insensible aux accents et à la casse, dans les noms et le contenu des notes et des PDF (pour un PDF, chaque ligne trouvée est précédée de sa page). Sert à retrouver un contact (nom, téléphone, ville), un sujet, une objection…",
       inputSchema: {
         texte: z.string().min(2),
         dossier: z.string().default("").describe("Limiter à un dossier, ex : « CRM GPM »"),
@@ -264,18 +295,42 @@ export function buildServer(): McpServer {
           const q = stripAccents(texte);
           const qDigits = texte.replace(/\D/g, "");
           const res: { chemin: string; lignes: string[] }[] = [];
-          for (const p of (await walk(await resolveInVault(dossier))).sort()) {
+          const hit = (l: string) => stripAccents(l).includes(q) || (qDigits.length >= 6 && l.replace(/\D/g, "").includes(qDigits));
+          const files = (await walk(await resolveInVault(dossier))).sort();
+          for (const p of files) {
             if (!/\.(md|base|canvas)$/.test(p)) continue;
             const t = await readText(p);
             const nameHit = stripAccents(path.basename(p)).includes(q);
             const lignes = t
               .split("\n")
-              .filter((l) => stripAccents(l).includes(q) || (qDigits.length >= 6 && l.replace(/\D/g, "").includes(qDigits)))
+              .filter(hit)
               .slice(0, 5)
               .map((l) => l.trim().slice(0, 300));
             if (nameHit || lignes.length) res.push({ chemin: toRel(p), lignes });
             if (res.length >= max) break;
           }
+          // PDF ensuite : l'extraction du texte est plus lente, on s'arrête après 90 s.
+          const debut = Date.now();
+          let nonLus = 0;
+          for (const p of files) {
+            if (!isPdf(p) || res.length >= max) continue;
+            const nameHit = stripAccents(path.basename(p)).includes(q);
+            const lignes: string[] = [];
+            if (Date.now() - debut > 90_000) nonLus++;
+            else {
+              try {
+                (await pdfPages(p)).forEach((page, i) => {
+                  for (const l of page.split("\n")) {
+                    if (lignes.length < 5 && hit(l)) lignes.push(`p. ${i + 1} : ${excerpt(l, q)}`);
+                  }
+                });
+              } catch {
+                // PDF illisible : seul son nom est comparé.
+              }
+            }
+            if (nameHit || lignes.length) res.push({ chemin: toRel(p), lignes });
+          }
+          if (nonLus) res.push({ chemin: "(recherche incomplète)", lignes: [`${nonLus} PDF non parcourus faute de temps : relancer la même recherche.`] });
           return res;
         });
         return json(out.length ? out : `Aucun résultat pour « ${texte} ».`);

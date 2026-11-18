@@ -40,12 +40,12 @@ async function writeConfig(mode: "pull-only" | "bidirectional") {
     deviceName: "Claude connecteur",
     syncMode: mode,
     conflictStrategy: "merge",
-    allowTypes: [], // .md, .base et .canvas seulement : pas de PDF ni d'images
+    allowTypes: ["pdf"], // .md, .base, .canvas et PDF : pas d'images, d'audio ni de vidéo
   };
   await fs.writeFile(path.join(dir, "config.json"), JSON.stringify(full, null, 2));
 }
 
-function runSync(): Promise<string> {
+function runSync(timeout = 120_000): Promise<string> {
   if (!process.env.OBSIDIAN_AUTH_TOKEN) {
     throw new Error("Variable OBSIDIAN_AUTH_TOKEN absente : le connecteur n'est pas configuré.");
   }
@@ -56,7 +56,7 @@ function runSync(): Promise<string> {
       [cli, "sync", "--path", VAULT_DIR],
       {
         env: { ...process.env, XDG_CONFIG_HOME: CONFIG_HOME, HOME: BASE },
-        timeout: 120_000,
+        timeout,
         maxBuffer: 20 * 1024 * 1024,
       },
       (err, stdout, stderr) => {
@@ -77,7 +77,8 @@ export async function sync(): Promise<void> {
     // Première synchro d'une instance neuve en lecture seule : impossible
     // qu'un dossier vide soit pris pour des suppressions.
     await writeConfig("pull-only");
-    await runSync();
+    // Le premier chargement télécharge aussi tous les PDF : délai plus long.
+    await runSync(240_000);
     await writeConfig("bidirectional");
     initialised = true;
   }
