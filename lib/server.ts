@@ -6,6 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { exclusive, sync, resolveInVault, toRel, walk, readText, writeText, VAULT_DIR } from "./vault.js";
 import { parseProps, setProps, appendToSection, renameLinks, stripAccents } from "./markdown.js";
 import { isPdf, pdfPages, readPdf } from "./pdf.js";
+import { pdfToMarkdown, verifierFiche } from "./fiches.js";
 import { etatCrm, todayParis, CRM_ROOT } from "./crm.js";
 
 const INSTRUCTIONS = `Connecteur du coffre Obsidian « Vie » de Stive (synchronisé par Obsidian Sync : ce que tu écris arrive sur son iPhone, son iPad et son Mac).
@@ -15,6 +16,7 @@ Deux espaces : « CRM GPM » (CRM commercial prévoyance GPM) et « Garde-robe �
 - Groupe toutes les modifications d'une dictée dans UN seul appel à \`modifier\`.
 - Pour le brief du matin ou une revue : \`etat_crm\`, puis écris la note dans « CRM GPM/Briefs » au format des briefs existants.
 - Les documents PDF du coffre se lisent avec \`lire\` (texte extrait, paramètre \`pages\` pour les longs documents) et sont couverts par \`chercher\`. Ils sont en lecture seule.
+- Fiches sourcées : chaque affirmation s'appuie sur une citation \`> [!quote] [[….pdf#page=N|Art. X, p. N]]\` suivie du texte exact ; après écriture, lancer \`verifier\` et corriger jusqu'à « conforme ».
 - Jamais de données de santé d'un contact dans le coffre.
 - Dates au format AAAA-MM-JJ, fuseau Europe/Paris.`;
 
@@ -43,14 +45,16 @@ function withVault<T>(fn: () => Promise<T>, pushAfter = false) {
 
 const Operation = z.object({
   op: z
-    .enum(["ecrire", "creer", "remplacer", "proprietes", "ajouter_ligne", "renommer", "supprimer"])
+    .enum(["ecrire", "creer", "remplacer", "proprietes", "ajouter_ligne", "renommer", "supprimer", "convertir_pdf"])
     .describe(
       "ecrire = créer ou écraser la note avec `contenu` ; creer = comme ecrire mais échoue si la note existe ; " +
         "remplacer = remplacer le texte exact `ancien` par `nouveau` (doit apparaître une seule fois) ; " +
         "proprietes = fusionner `proprietes` dans le frontmatter (null supprime une propriété) ; " +
         "ajouter_ligne = ajouter `ligne` à la fin de la section `section` (ex : « Historique », « Actions ») ; " +
         "renommer = déplacer/renommer vers `nouveau_chemin` et mettre à jour tous les liens [[...]] du coffre ; " +
-        "supprimer = supprimer la note (récupérable dans l'historique Obsidian Sync).",
+        "supprimer = supprimer la note (récupérable dans l'historique Obsidian Sync) ; " +
+        "convertir_pdf = créer la note « texte intégral » du PDF `chemin` (texte extrait mécaniquement, une section par page, sans passer par Claude), " +
+        "à côté du PDF ou vers `nouveau_chemin`.",
     ),
   chemin: z.string().describe("Chemin depuis la racine du coffre, extension comprise. Ex : « CRM GPM/Contacts/Jean-Marc SOUTY.md »."),
   contenu: z.string().optional(),
@@ -66,8 +70,16 @@ type Op = z.infer<typeof Operation>;
 async function applyOp(o: Op): Promise<string> {
   const abs = await resolveInVault(o.chemin);
   const rel = toRel(abs);
+  if (o.op === "convertir_pdf") {
+    if (!isPdf(abs) || !existsSync(abs)) throw new Error(`PDF introuvable : ${o.chemin}`);
+    const dest = await resolveInVault(o.nouveau_chemin ?? `${rel.replace(/\.pdf$/i, "")} (texte intégral).md`);
+    if (!dest.endsWith(".md")) throw new Error(`La destination doit être une note .md : ${o.nouveau_chemin}`);
+    const md = await pdfToMarkdown(abs, todayParis());
+    await writeText(dest, md);
+    return `converti : ${rel} → ${toRel(dest)} (${(md.match(/^## Page /gm) ?? []).length} pages)`;
+  }
   if (isPdf(abs) && o.op !== "renommer" && o.op !== "supprimer") {
-    throw new Error(`${o.op} impossible sur un PDF : ${rel} (seuls renommer et supprimer sont permis)`);
+    throw new Error(`${o.op} impossible sur un PDF : ${rel} (seuls renommer, supprimer et convertir_pdf sont permis)`);
   }
   const need = <K extends keyof Op>(k: K): NonNullable<Op[K]> => {
     if (o[k] === undefined || o[k] === null) throw new Error(`${o.op} sur « ${o.chemin} » : champ « ${String(k)} » manquant`);
@@ -334,6 +346,49 @@ export function buildServer(): McpServer {
           return res;
         });
         return json(out.length ? out : `Aucun résultat pour « ${texte} ».`);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.registerTool(
+    "verifier",
+    {
+      title: "Vérifier les citations de fiches",
+      description:
+        "Contrôle mécanique de fiches sourcées : chaque citation « > [!quote] [[….pdf#page=N|…]] » doit figurer mot pour mot à la page indiquée du PDF. " +
+        "Signale aussi les chiffres affirmés sans appui dans une citation et les PDF modifiés depuis la validation (propriété `empreintes`). " +
+        "À lancer après chaque écriture de fiche : une fiche « non conforme » ne doit pas servir à répondre.",
+      inputSchema: {
+        chemins: z.array(z.string()).max(50).default([]).describe("Fiches à contrôler"),
+        dossier: z.string().default("").describe("Ou un dossier entier : toutes les notes contenant au moins une citation"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chemins, dossier }) => {
+      try {
+        if (!chemins.length && !dossier) throw new Error("Indiquer `chemins` ou `dossier`.");
+        const out = await withVault(async () => {
+          const targets: string[] = [];
+          for (const c of chemins) targets.push(await resolveInVault(c));
+          const fromDir = dossier ? (await walk(await resolveInVault(dossier))).filter((p) => p.endsWith(".md")).sort() : [];
+          const res = [];
+          for (const abs of targets) {
+            if (!existsSync(abs)) res.push({ fiche: toRel(abs), verdict: "non conforme", erreurs: ["Fiche introuvable."] });
+            else {
+              const md = await readText(abs);
+              res.push(await verifierFiche(abs, md, parseProps(md)));
+            }
+          }
+          for (const abs of fromDir) {
+            if (targets.includes(abs)) continue;
+            const md = await readText(abs);
+            if (/^>\s*\[!quote\]/im.test(md)) res.push(await verifierFiche(abs, md, parseProps(md)));
+          }
+          return res;
+        });
+        return json(out);
       } catch (e) {
         return fail(e);
       }
