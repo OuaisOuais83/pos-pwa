@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/mcp.ts": {
+      "maxDuration": 300,
+      "memory": 1024,
+      "includeFiles": "node_modules/{obsidian-headless,better-sqlite3,bindings,file-uri-to-path,commander}/**"
+    }
+  },
+  "rewrites": [
+    { "source": "/:k/mcp", "destination": "/api/mcp?k=:k" }
+  ]
+}
