@@ -16,7 +16,7 @@ Deux espaces : « CRM GPM » (CRM commercial prévoyance GPM) et « Garde-robe �
 - Groupe toutes les modifications d'une dictée dans UN seul appel à \`modifier\`.
 - Pour le brief du matin ou une revue : \`etat_crm\`, puis écris la note dans « CRM GPM/Briefs » au format des briefs existants.
 - Les documents PDF du coffre se lisent avec \`lire\` (texte extrait, paramètre \`pages\` pour les longs documents) et sont couverts par \`chercher\`. Ils sont en lecture seule.
-- RÈGLE ABSOLUE : une note n'est « Validé » que si \`verifier\` la donne conforme sans aucun avertissement (chaque affirmation et chaque chiffre appuyés par une citation exacte du PDF source). Sinon « À tester » ou « Brouillon ». \`modifier\` déclasse d'office toute note validée sans preuve, et \`etat_crm\` liste celles qui le seraient redevenues (\`fiches_validees_sans_preuve\`). Ne jamais répondre sur un point contractuel depuis une note non validée sans le dire et sans citer le PDF.
+- RÈGLE ABSOLUE : une note n'est « Validé » que si \`verifier\` la donne conforme sans aucun avertissement (chaque affirmation et chaque chiffre appuyés par une citation exacte du PDF source). Sinon « À tester » ou « Brouillon ». \`modifier\` signale toute note validée sans preuve, et \`etat_crm\` liste celles qui le seraient redevenues (\`fiches_validees_sans_preuve\`). Ne jamais répondre sur un point contractuel depuis une note non validée sans le dire et sans citer le PDF.
 - Fiches sourcées : chaque affirmation s'appuie sur une citation \`> [!quote] [[….pdf#page=N|Art. X, p. N]]\` suivie du texte exact ; après écriture, lancer \`verifier\` et corriger jusqu'à « conforme ».
 - Jamais de données de santé d'un contact dans le coffre.
 - Dates au format AAAA-MM-JJ, fuseau Europe/Paris.`;
@@ -47,7 +47,7 @@ async function valideesATort(dirAbs: string): Promise<{ fiche: string; motifs: s
   return out;
 }
 
-/** Garde-fou : une note touchée et marquée validée sans preuve est déclassée d'office en « À tester ». */
+/** Garde-fou : signale toute note touchée qui est marquée validée sans preuve complète (sans changer son statut). */
 async function declasserSiNonProuvee(abs: string): Promise<string | null> {
   if (!abs.endsWith(".md") || !existsSync(abs)) return null;
   const md = await readText(abs);
@@ -55,10 +55,7 @@ async function declasserSiNonProuvee(abs: string): Promise<string | null> {
   if (!estValidee(props)) return null;
   const motifs = await motifsNonProuvee(abs, md, props);
   if (!motifs.length) return null;
-  const maj: Record<string, unknown> = { maturite: "À tester" };
-  if (typeof props.statut === "string") maj.statut = "brouillon";
-  await writeText(abs, setProps(md, maj));
-  return `DÉCLASSÉE en « À tester » (validation refusée) : ${toRel(abs)} : ${motifs.length} motif(s), dont : ${motifs[0].slice(0, 160)}`;
+  return `ATTENTION : ${toRel(abs)} est marquée « Validé » sans preuve complète (${motifs.length} motif(s), dont : ${motifs[0].slice(0, 160)}). Statut laissé tel quel : à vérifier avec \`verifier\`.`;
 }
 
 /** Lance une opération sur un coffre à jour ; option : resynchroniser après écriture. */
@@ -408,7 +405,7 @@ export function buildServer(): McpServer {
         "Contrôle mécanique de fiches sourcées : chaque citation « > [!quote] [[….pdf#page=N|…]] » doit figurer mot pour mot à la page indiquée du PDF. " +
         "Signale aussi les chiffres affirmés sans appui dans une citation et les PDF modifiés depuis la validation (propriété `empreintes`). " +
         "Sur un dossier, contrôle aussi toute note marquée « Validé », même sans citation : `validee_a_tort: true` signale une note validée sans preuve. " +
-        "Règle : une note ne peut être « Validé » que si elle est conforme et sans aucun avertissement ; `modifier` déclasse d'office les autres.",
+        "Règle : une note ne peut être « Validé » que si elle est conforme et sans aucun avertissement ; `modifier` signale les autres.",
       inputSchema: {
         chemins: z.array(z.string()).max(50).default([]).describe("Fiches à contrôler"),
         dossier: z.string().default("").describe("Ou un dossier entier : toutes les notes contenant au moins une citation"),
@@ -465,7 +462,7 @@ export function buildServer(): McpServer {
           try {
             for (const o of operations) done.push(await applyOp(o));
           } finally {
-            // Aucune note ne reste « Validé » sans preuve après une écriture.
+            // Toute note validée sans preuve est signalée après une écriture.
             const touchees = new Set<string>();
             for (const o of operations) {
               for (const c of [o.chemin, o.nouveau_chemin]) if (c) touchees.add(await resolveInVault(c).catch(() => ""));
